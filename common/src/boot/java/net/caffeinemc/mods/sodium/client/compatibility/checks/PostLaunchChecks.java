@@ -17,10 +17,10 @@ public class PostLaunchChecks {
         GraphicsDriverChecks.postContextInit(window, context);
         NvidiaWorkarounds.applyContextChanges(context);
 
-        // FIXME: This can be determined earlier, but we can't access the GUI classes in pre-launch
+        // warn instead of crash :D
         if (isUsingPojavLauncher()) {
-            throw new RuntimeException("It appears that you are using PojavLauncher, which is not supported when " +
-                    "using Sodium. Please check your mods list.");
+            LOGGER.warn("Detected a PojavLauncher-like environment. The upstream compatibility block for this " +
+                    "has been disabled; continuing to load Sodium normally.");
         }
     }
 
