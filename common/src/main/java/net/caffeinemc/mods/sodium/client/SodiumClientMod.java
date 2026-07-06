@@ -8,6 +8,7 @@ import net.caffeinemc.mods.sodium.client.gui.SodiumDebugEntry;
 import net.caffeinemc.mods.sodium.client.gui.SodiumFpsPercentilesEntry;
 import net.caffeinemc.mods.sodium.client.gui.SodiumOptions;
 import net.caffeinemc.mods.sodium.client.services.PlatformRuntimeInformation;
+import net.caffeinemc.mods.sodium.client.util.HangWatchdog;
 import net.caffeinemc.mods.sodium.mixin.features.gui.hooks.debug.DebugScreenEntriesAccessor;
 import net.minecraft.resources.Identifier;
 import org.slf4j.Logger;
@@ -39,6 +40,8 @@ public class SodiumClientMod {
         } catch (Throwable t) {
             LOGGER.error("Failed to update fingerprint", t);
         }
+
+        HangWatchdog.start();
     }
 
     public static SodiumOptions options() {
