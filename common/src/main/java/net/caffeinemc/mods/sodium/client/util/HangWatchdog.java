@@ -7,9 +7,13 @@ import java.io.File;
 import java.io.FileWriter;
 import java.io.IOException;
 import java.io.PrintWriter;
+import java.lang.management.LockInfo;
+import java.lang.management.ManagementFactory;
+import java.lang.management.MonitorInfo;
+import java.lang.management.ThreadInfo;
+import java.lang.management.ThreadMXBean;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
-import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -21,24 +25,26 @@ import java.util.concurrent.atomic.AtomicLong;
 public class HangWatchdog {
     private static final Logger LOGGER = LoggerFactory.getLogger("Sodium-HangWatchdog");
 
-    // how long without a heartbeat before consider the game "frozen"
+    // How long without a heartbeat before we consider the game "frozen".
     private static final long STALL_THRESHOLD_MS = 4000;
-    // how often the watchdog thread checks
+    // How often the watchdog thread checks.
     private static final long CHECK_INTERVAL_MS = 1000;
-    // minim time between two dumps for the *same* stall episode, so don't spam files
-    // if the freeze lasts a long time (one dump right away, then one every 15s while still stuck)
+    // Minimum time between two dumps for the *same* stall episode, so we don't spam files
+    // if the freeze lasts a long time (one dump right away, then one every 15s while still stuck).
     private static final long REDUMP_INTERVAL_MS = 15000;
+
+    private static final ThreadMXBean THREAD_MX_BEAN = ManagementFactory.getThreadMXBean();
 
     private static final AtomicLong lastHeartbeatMs = new AtomicLong(System.currentTimeMillis());
     private static final AtomicBoolean started = new AtomicBoolean(false);
     private static volatile long lastDumpMs = 0;
 
-    /** call this once per frame/tick from the render loop. cheap: just a volatile write */
+    /** Call this once per frame/tick from the render loop. Cheap: just a volatile write. */
     public static void heartbeat() {
         lastHeartbeatMs.set(System.currentTimeMillis());
     }
 
-    /** call once during mod init. safe to call multiple times; only starts once */
+    /** Call once during mod init. Safe to call multiple times; only starts once. */
     public static void start() {
         if (!started.compareAndSet(false, true)) {
             return;
@@ -71,7 +77,7 @@ public class HangWatchdog {
                     lastDumpMs = now;
                 }
             } else {
-                // heartbeat resumed; allow a fresh immediate dump next time it stalls
+                // Heartbeat resumed; allow a fresh immediate dump next time it stalls.
                 lastDumpMs = 0;
             }
         }
@@ -93,24 +99,28 @@ public class HangWatchdog {
             writer.println("No heartbeat for: " + stalledForMs + " ms");
             writer.println();
 
-            Map<Thread, StackTraceElement[]> allStacks = Thread.getAllStackTraces();
+            long[] deadlockedIds = THREAD_MX_BEAN.findDeadlockedThreads();
+            if (deadlockedIds != null && deadlockedIds.length > 0) {
+                writer.println("*** JVM-CONFIRMED DEADLOCK detected among " + deadlockedIds.length + " thread(s) ***");
+                writer.println();
+            } else {
+                writer.println("(No JVM-confirmed deadlock cycle found; may still be blocked on I/O, a native call, or a livelock.)");
+                writer.println();
+            }
 
-            // print the most relevant threads first
-            printThreadIfPresent(writer, allStacks, "Render thread");
-            printThreadIfPresent(writer, allStacks, "Client thread");
+            ThreadInfo[] allThreads = THREAD_MX_BEAN.dumpAllThreads(true, true);
+
+            // Print the most relevant threads first.
+            printThreadIfPresent(writer, allThreads, "Render thread");
+            printThreadIfPresent(writer, allThreads, "Client thread");
 
             writer.println();
             writer.println("=== All threads ===");
 
-            for (Map.Entry<Thread, StackTraceElement[]> entry : allStacks.entrySet()) {
-                Thread thread = entry.getKey();
+            for (ThreadInfo info : allThreads) {
+                if (info == null) continue;
                 writer.println();
-                writer.println("Thread: \"" + thread.getName() + "\" id=" + thread.getId()
-                        + " state=" + thread.getState() + " daemon=" + thread.isDaemon());
-
-                for (StackTraceElement element : entry.getValue()) {
-                    writer.println("\tat " + element);
-                }
+                printThreadInfo(writer, info);
             }
 
             writer.flush();
@@ -121,15 +131,48 @@ public class HangWatchdog {
         }
     }
 
-    private static void printThreadIfPresent(PrintWriter writer, Map<Thread, StackTraceElement[]> allStacks, String nameContains) {
-        for (Map.Entry<Thread, StackTraceElement[]> entry : allStacks.entrySet()) {
-            if (entry.getKey().getName().contains(nameContains)) {
-                writer.println("=== " + entry.getKey().getName() + " (highlighted) ===");
-                writer.println("state=" + entry.getKey().getState());
-                for (StackTraceElement element : entry.getValue()) {
-                    writer.println("\tat " + element);
-                }
+    private static void printThreadIfPresent(PrintWriter writer, ThreadInfo[] allThreads, String nameContains) {
+        for (ThreadInfo info : allThreads) {
+            if (info != null && info.getThreadName().contains(nameContains)) {
+                writer.println("=== " + info.getThreadName() + " (highlighted) ===");
+                printThreadInfo(writer, info);
                 writer.println();
+            }
+        }
+    }
+
+    private static void printThreadInfo(PrintWriter writer, ThreadInfo info) {
+        writer.println("Thread: \"" + info.getThreadName() + "\" id=" + info.getThreadId()
+                + " state=" + info.getThreadState()
+                + (info.isDaemon() ? " daemon" : ""));
+
+        LockInfo lockInfo = info.getLockInfo();
+        if (lockInfo != null) {
+            writer.println("\t- waiting on: " + lockInfo
+                    + (info.getLockOwnerName() != null
+                        ? " owned by \"" + info.getLockOwnerName() + "\" (id=" + info.getLockOwnerId() + ")"
+                        : " (owner unknown - not a monitor, or owner not tracked)"));
+        }
+
+        StackTraceElement[] stack = info.getStackTrace();
+        MonitorInfo[] lockedMonitors = info.getLockedMonitors();
+
+        for (int i = 0; i < stack.length; i++) {
+            writer.println("\tat " + stack[i]);
+            // Show exactly which stack frame is holding which lock - this is what makes it
+            // possible to see "thread A holds lock X here, while thread B waits on lock X".
+            for (MonitorInfo m : lockedMonitors) {
+                if (m.getLockedStackFrame().equals(stack[i])) {
+                    writer.println("\t- locked: " + m);
+                }
+            }
+        }
+
+        LockInfo[] lockedSynchronizers = info.getLockedSynchronizers();
+        if (lockedSynchronizers.length > 0) {
+            writer.println("\tLocked synchronizers (java.util.concurrent):");
+            for (LockInfo l : lockedSynchronizers) {
+                writer.println("\t- " + l);
             }
         }
     }
